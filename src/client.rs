@@ -1,8 +1,14 @@
+use std::time::Duration;
+
 use clap::Args;
 use futures::{SinkExt, StreamExt};
 use http::Uri;
+use hyper_util::rt::TokioIo;
 use rustix::termios;
+use signal_hook::consts::SIGWINCH;
+use signal_hook_tokio::{Handle as SignalHandle, Signals};
 use tokio::net::TcpStream;
+use tokio::task::JoinHandle;
 use tokio_tungstenite::{connect_async as ws_connect_async, MaybeTlsStream, WebSocketStream};
 use tungstenite::ClientRequestBuilder;
 
@@ -21,7 +27,7 @@ pub struct ClientCli {
 
 type AttachConnection = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-async fn request_attach(address: String, session_id: u64) -> Result<AttachConnection, Error> {
+async fn request_attach(address: &str, session_id: u64) -> Result<AttachConnection, Error> {
     let uri = Uri::builder()
         .scheme("ws")
         .authority(address)
@@ -29,21 +35,63 @@ async fn request_attach(address: String, session_id: u64) -> Result<AttachConnec
         .build()
         .map_err(|_| "Invalid address")?;
     let req = ClientRequestBuilder::new(uri)
-        .with_header("Session", format!("{}", session_id));
+        .with_header("X-Session", format!("{}", session_id));
     let (socket, _response) = ws_connect_async(req).await?;
     Ok(socket)
 }
 
 async fn send_terminal_size(address: String, session_id: u64) -> Result<(), Error> {
     let winsize = termios::tcgetwinsize(std::io::stdout())?;
-    let uri = Uri::builder()
-        .scheme("http")
-        .authority(address)
-        .path_and_query("/resize")
-        .build()
-        .map_err(|_| "Invalid address")?;
-    // TODO: send
+
+    let stream = TcpStream::connect(&address).await?;
+    let io = TokioIo::new(stream);
+
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
+    tokio::task::spawn(async move {
+        if let Err(err) = conn.await {
+            println!("Connection failed: {:?}", err);
+        }
+    });
+
+    let req = hyper::Request::builder()
+        .uri("/resize")
+        .header(hyper::header::HOST, address)
+        .header("X-Session", format!("{}", session_id))
+        .header("X-Terminal-Columns", format!("{}", winsize.ws_col))
+        .header("X-Terminal-Rows", format!("{}", winsize.ws_row))
+        .body(http_body_util::Empty::<hyper::body::Bytes>::new())?;
+
+    let mut res = sender.send_request(req).await?;
+
     Ok(())
+}
+
+struct ResizeHandle {
+    signal_handle: SignalHandle,
+    task_handle: JoinHandle<()>,
+}
+
+async fn handle_sigwinch(mut signals: Signals, address: String, session_id: u64) {
+    while let Some(signal) = signals.next().await {
+        match signal {
+            SIGWINCH => {
+                tokio::spawn(send_terminal_size(address.clone(), session_id));
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+fn handle_resizes(address: &str, session_id: u64) -> Result<ResizeHandle, Error> {
+    let signals = Signals::new(&[SIGWINCH])?;
+    let signal_handle = signals.handle();
+    let task_handle = tokio::spawn(handle_sigwinch(signals, address.into(), session_id));
+    Ok(ResizeHandle { signal_handle, task_handle })
+}
+
+async fn clear_resize_listener(handles: ResizeHandle) -> Result<(), Error> {
+    handles.signal_handle.close();
+    Ok(handles.task_handle.await?)
 }
 
 pub async fn attach(options: ClientCli) -> Result<(), Error> {
@@ -55,7 +103,7 @@ pub async fn attach(options: ClientCli) -> Result<(), Error> {
         return Err("stdin is not a tty, you monster".into());
     }
 
-    let mut connection = match request_attach(options.address, options.session_id).await {
+    let mut connection = match request_attach(&options.address, options.session_id).await {
         Ok(connection) => connection,
         Err(err) => {
             eprintln!("Couldn't attach: {}", err);
@@ -63,6 +111,12 @@ pub async fn attach(options: ClientCli) -> Result<(), Error> {
         },
     };
 
+    let handle = handle_resizes(&options.address, options.session_id)?;
+
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
     connection.close(None).await?;
+    clear_resize_listener(handle).await?;
+
     Ok(())
 }
