@@ -18,9 +18,14 @@ type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
 use thiserror::Error;
 
 static STATE: std::sync::OnceLock<std::sync::Mutex<BTreeMap<u64, Option<SessionState>>>> = std::sync::OnceLock::new();
+static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn get_state() -> std::sync::MutexGuard<'static, BTreeMap<u64, Option<SessionState>>> {
     STATE.get_or_init(|| std::sync::Mutex::new(BTreeMap::new())).lock().unwrap()
+}
+
+fn next_counter() -> u64 {
+    COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -47,6 +52,11 @@ impl SessionState {
     pub async fn submit(&self, command: String) -> Result<(), Error> {
         self.cmd_sender.send(command).await?;
         Ok(())
+    }
+
+    pub async fn create_and_insert(proc: Child) -> (SessionStateGuard, mpsc::Receiver<Vec<u8>>, mpsc::Receiver<String>) {
+        let new_id = next_counter();
+        todo!()
     }
 }
 
@@ -156,21 +166,21 @@ async fn submit_command(session_id: u64, command: String) -> Result<(), Error> {
 
 async fn handle_request(mut request: Request<Incoming>) -> Result<Response<Full<Bytes>>, Error> {
     let headers = request.headers();
-    let session_id = headers.get("Session")
+    let session_id = headers.get("X-Session")
         .and_then(|session| session.to_str().ok())
         .and_then(|session| session.parse::<u64>().ok());
 
-    let command = headers.get("Command")
+    let command = headers.get("X-Command")
         .map(|s| s.as_bytes())
         .and_then(|s| String::from_utf8(s.to_vec()).ok());
 
-    let terminal = headers.get("Terminal")
+    let terminal = headers.get("X-Terminal")
         .map(|s| s.as_bytes())
         .and_then(|s| String::from_utf8(s.to_vec()).ok());
-    let term_size_y = headers.get("Terminal-Rows")
+    let term_size_y = headers.get("X-Terminal-Rows")
         .and_then(|s| str::from_utf8(s.as_bytes()).ok())
         .and_then(|s| s.parse::<u64>().ok());
-    let term_size_x = headers.get("Terminal-Columns")
+    let term_size_x = headers.get("X-Terminal-Columns")
         .and_then(|s| str::from_utf8(s.as_bytes()).ok())
         .and_then(|s| s.parse::<u64>().ok());
 
@@ -181,8 +191,19 @@ async fn handle_request(mut request: Request<Incoming>) -> Result<Response<Full<
         },
         "/new" => {
             let command = command.unwrap_or("bash".to_owned());
+            let proc = match Command::new(command).spawn() {
+                Ok(proc) => proc,
+                Err(e) => {
+                    return Err(e)?;
+                }
+            };
+            let (state, keyboard, commands) = SessionState::create_and_insert(proc).await;
+            let screen = state.screen_sender.clone();
+
             tokio::spawn(async move {
-                Command::new(command).spawn();
+                loop {
+
+                }
             });
             Ok(Response::new(Full::<Bytes>::from("Ok")))
         },
@@ -192,7 +213,7 @@ async fn handle_request(mut request: Request<Incoming>) -> Result<Response<Full<
         "/complete" => {
             todo!()
         },
-        "/run-command" | "/attach-command" | "/attach-shell" => {
+        "/resize" | "/run-command" | "/attach-command" | "/attach-shell" => {
             let Some(session_id) = session_id else {
                 return Ok(Response::builder().status(405).body(Full::<Bytes>::from("No session"))?);
             };
@@ -220,6 +241,7 @@ async fn handle_request(mut request: Request<Incoming>) -> Result<Response<Full<
                     }
                     false
                 }
+                "/resize" => true,
                 _ => unreachable!()
             };
 
@@ -231,6 +253,10 @@ async fn handle_request(mut request: Request<Incoming>) -> Result<Response<Full<
             }
             if let Some(term_size_x) = term_size_x {
                 session.current_size_x = term_size_x;
+            }
+
+            if request.uri().path() == "/resize" {
+                return Ok(Response::new(Full::<Bytes>::from("Ok")));
             }
 
             if hyper_tungstenite::is_upgrade_request(&request) {
