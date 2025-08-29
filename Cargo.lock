@@ -744,12 +744,15 @@ dependencies = [
  "clap",
  "futures",
  "futures-util",
+ "http",
  "http-body-util",
  "hyper",
  "hyper-tungstenite",
  "hyper-util",
  "thiserror",
  "tokio",
+ "tokio-tungstenite",
+ "tungstenite",
 ]
 
 [[package]]
